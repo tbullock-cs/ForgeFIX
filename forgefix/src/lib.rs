@@ -135,7 +135,7 @@ enum Request {
         resp_sender: oneshot::Sender<bool>,
     },
     SendMessage {
-        resp_sender: oneshot::Sender<bool>,
+        resp_sender: SendAck,
         builder: MessageBuilder,
     },
     Logout {
@@ -146,6 +146,37 @@ enum Request {
         next_outbound: u32,
         expected_inbound: u32,
     },
+}
+
+/// How a queued outbound message reports its result to the application.
+enum SendAck {
+    /// Yields whether the message was sent.
+    Sent(oneshot::Sender<bool>),
+    /// Yields the `MsgSeqNum(34)` the message was sent with, or `None` if it was not sent.
+    SeqNum(oneshot::Sender<Option<u32>>),
+}
+
+impl SendAck {
+    fn sent(self, msg_seq_num: u32) {
+        match self {
+            SendAck::Sent(resp_sender) => {
+                let _ = resp_sender.send(true);
+            }
+            SendAck::SeqNum(resp_sender) => {
+                let _ = resp_sender.send(Some(msg_seq_num));
+            }
+        }
+    }
+    fn failed(self) {
+        match self {
+            SendAck::Sent(resp_sender) => {
+                let _ = resp_sender.send(false);
+            }
+            SendAck::SeqNum(resp_sender) => {
+                let _ = resp_sender.send(None);
+            }
+        }
+    }
 }
 
 /// Errors that can occur while running ForgeFIX.
@@ -206,6 +237,7 @@ pub struct SessionSettings {
     start_time: NaiveTime,
     session_start_instant: Option<DateTime<Utc>>,
     initiator_logon_hook: Option<Arc<dyn InitiatorLogonHook>>,
+    forward_session_rejects: bool,
 }
 
 /// A builder for easily configuring all the fields of a [`SessionSettings`]
@@ -230,6 +262,7 @@ pub struct SessionSettingsBuilder {
     start_time: Option<NaiveTime>,
     session_start_instant: Option<DateTime<Utc>>,
     initiator_logon_hook: Option<Arc<dyn InitiatorLogonHook>>,
+    forward_session_rejects: bool,
 }
 
 impl SessionSettingsBuilder {
@@ -357,6 +390,18 @@ impl SessionSettingsBuilder {
         self.initiator_logon_hook = Some(initiator_logon_hook);
     }
 
+    /// Whether inbound session-level `Reject<3>` messages are also delivered on the application
+    /// message channel. Off by default. The engine handles them as usual either way; forwarding
+    /// lets the application match `RefSeqNum(45)` against the sequence numbers returned by
+    /// [`FixApplicationHandle::send_message_with_seq_num`].
+    pub fn with_forward_session_rejects(mut self, forward_session_rejects: bool) -> Self {
+        self.set_forward_session_rejects(forward_session_rejects);
+        self
+    }
+    pub fn set_forward_session_rejects(&mut self, forward_session_rejects: bool) {
+        self.forward_session_rejects = forward_session_rejects;
+    }
+
     /// Build the [`SessionSettings`] struct.
     ///
     /// Returns an `Err(ApplicationError::SettingRequired)` if not all of the required fields
@@ -399,6 +444,7 @@ impl SessionSettingsBuilder {
             store_path,
             log_dir,
             initiator_logon_hook: self.initiator_logon_hook,
+            forward_session_rejects: self.forward_session_rejects,
         })
     }
 }
@@ -594,7 +640,7 @@ impl FixApplicationHandle {
         }
         let (resp_sender, resp_receiver) = oneshot::channel();
         let send_message_request = Request::SendMessage {
-            resp_sender,
+            resp_sender: SendAck::Sent(resp_sender),
             builder,
         };
         let _ = self.request_sender.send(send_message_request);
@@ -619,6 +665,55 @@ impl FixApplicationHandle {
             return Err(ApplicationError::SendMessageFailed);
         }
         Ok(())
+    }
+
+    /// Like [`send_message`], but the receiver yields the `MsgSeqNum(34)` the message was sent
+    /// with, or `None` if it cannot be sent.
+    ///
+    /// A peer's session-level `Reject<3>` identifies the message it rejects only by
+    /// `RefSeqNum(45)`, so this is how an application correlates such rejects (see
+    /// [`SessionSettingsBuilder::with_forward_session_rejects`]).
+    ///
+    /// [`send_message`]: FixApplicationHandle::send_message
+    pub fn send_message_with_seq_num(
+        &self,
+        builder: MessageBuilder,
+    ) -> Result<oneshot::Receiver<Option<u32>>, ApplicationError> {
+        if self.request_sender.is_closed() {
+            return Err(ApplicationError::SessionEnded);
+        }
+        let (resp_sender, resp_receiver) = oneshot::channel();
+        let send_message_request = Request::SendMessage {
+            resp_sender: SendAck::SeqNum(resp_sender),
+            builder,
+        };
+        let _ = self.request_sender.send(send_message_request);
+        Ok(resp_receiver)
+    }
+    /// Send the message in `builder` and await the `MsgSeqNum(34)` it was sent with.
+    pub async fn send_message_with_seq_num_async(
+        &self,
+        builder: MessageBuilder,
+    ) -> Result<u32, ApplicationError> {
+        let resp_receiver = self.send_message_with_seq_num(builder)?;
+        resp_receiver
+            .await
+            .ok()
+            .flatten()
+            .ok_or(ApplicationError::SendMessageFailed)
+    }
+    /// Send the message in `builder` and block until the `MsgSeqNum(34)` it was sent with is
+    /// returned.
+    pub fn send_message_with_seq_num_sync(
+        &self,
+        builder: MessageBuilder,
+    ) -> Result<u32, ApplicationError> {
+        let resp_receiver = self.send_message_with_seq_num(builder)?;
+        resp_receiver
+            .blocking_recv()
+            .ok()
+            .flatten()
+            .ok_or(ApplicationError::SendMessageFailed)
     }
 
     /// Send a request to the engine to set sequence numbers and return immediately.
@@ -755,7 +850,9 @@ where
     /// The application handle can be used to start the FIX connection, send messages and end the
     /// connection.
     ///
-    /// The receiver is a channel where all incoming, valid application messages can be received.
+    /// The receiver is a channel where all incoming, valid application messages can be received,
+    /// along with session-level `Reject<3>` messages when
+    /// [`SessionSettingsBuilder::with_forward_session_rejects`] is enabled.
     /// If you do not want to use the channel, it is recommended you call [`close`].
     ///
     /// [`close`]: tokio::sync::mpsc::UnboundedReceiver::close
